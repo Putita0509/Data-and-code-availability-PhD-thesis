@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+# USAGE: bash run_all_consensus_from_demultiplexed_ONT_batcov.sh full_path_barcode_folders 
+# e.g:  bash run_all_consensus_from_demultiplexed_ONT_batcov.sh /srv/teyputita/ONT_READ_ARCHIVE/fastq_pass_XXXX
+
+# Don't edit below unless you know what you are doing
+#===================================================#
+
+read_dir=$1
+
+base=$(basename $read_dir)
+output_dir=/srv/$USER/ARTIC_nCoV-2019_output/${base}
+
+#Activate the Conda artic-ncov2019_env 
+source ~/miniconda3/bin/activate
+
+# Make sure the read directory is ready to go
+if [ ! -d $read_dir ]; then
+    echo "Error: "$read_dir" does not exist"
+	echo "       please check the entered path" 
+    read line; exit 1
+fi
+
+# # Make sure the output directory is ready to go
+mkdir -p $output_dir
+if [ ! -z "$(ls -A $output_dir)" ]; then
+    echo "Error: the output directory "$output_dir" is not empty"
+    echo "       please move/delete existing data before running" 
+    read line; exit 1
+fi
+
+mkdir ${output_dir}/tmp
+for id in `echo 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 | cat`; do 
+	if [ ! -z "$(ls -A ${read_dir}/barcode${id}/)"  ]; then
+		cd  ${output_dir}/tmp
+			mkdir ./fastqc_output
+		
+		conda activate artic-ncov2019_env
+		
+	## Evaluating the quality of raw dataset (all raw submitted data with q-score > 9, had already discarded barcodes and adaptors) by using FastQC, and then filtering them.
+	
+		fastqc ${output_dir}/tmp/barcode${id}_Ampliseq_RshCoV.fastq.gz -o ${output_dir}/tmp/fastqc_output
+		seqkit seq -w 0 -g --min-len 100 --max-len 2000 > ${output_dir}/tmp/barcode${id}_filt.fastq < ${output_dir}/tmp/barcode${id}_Ampliseq_RshCoV.fastq.gz
+		fastqc ${output_dir}/tmp/barcode${id}_filt.fastq -o ${output_dir}/tmp/fastqc_output
+		
+	## Generating a consensus FASTA file using the artic minion pipeline, with bcftools consensus available in that pipeline, from the filtered data.
+		
+		artic minion --strict \
+				--normalise 1000 \
+				--medaka --medaka-model r941_min_high_g360 \
+				--threads 64 \
+				--scheme-directory ~/artic-ncov2019/primer_schemes \
+				--read-file ${output_dir}/tmp/barcode${id}_filt.fastq batcov/V5e/  barcode${id}
+		cp ${output_dir}/tmp/barcode${id}.consensus.fasta ${output_dir}
+		
+		##Note: generating a first consensus sequence.
+		
+	## Generating a second consensus sequence using samtools mpileup with iVar from the BAM file without primers, produced by minimap2 	
+	    ## The filtered data was mapped to the batcov reference sequence using minimap2. 
+	    ## The primer sequences were then trimmed using align_trim. 
+	    ## The second consensus sequence was generated using samtools mpileup with iVar.
+		
+		minimap2 -a -x map-ont -t 64 ~/artic-ncov2019/primer_schemes/batcov/V5e//batcov.reference.fasta ${output_dir}/tmp/barcode${id}_filt.fastq | samtools view -bS -F 4 - | samtools sort -o ${output_dir}/tmp/barcode${id}_sorted.bam
+		align_trim --normalise 1000 ~/artic-ncov2019/primer_schemes/batcov/V5e//batcov.primer.bed > ${output_dir}/tmp/barcode${id}_trim.bam < ${output_dir}/tmp/barcode${id}_sorted.bam
+		samtools sort ${output_dir}/tmp/barcode${id}_trim.bam -o ${output_dir}/tmp/barcode${id}.trim_sorted.bam
+		samtools index ${output_dir}/tmp/barcode${id}.trim_sorted.bam
+		samtools mpileup -aa -A -d 600000 -Q 0 ${output_dir}/tmp/barcode${id}.trim_sorted.bam | ivar consensus -p ${output_dir}/tmp/barcode${id}.primertrim -q 1 -m 20 -n N
+		cp ${output_dir}/tmp/barcode${id}.primertrim.fa ${output_dir}
+		
+		##Note: generating a second consensus sequence.
+		
+	## The first and second consensus sequences were aligned, and potential artifacts were visually inspected. 
+	## The cleaned consensus sequence was then used as a reference for a second mapping, and a final consensus was generated after primers trimming.
+	   ## The filtered data was mapped to the cleaned consensus sequence using minimap2. 
+	   ## The primer sequences were then trimmed using align_trim.
+	   ## The final consensus sequence was generated using samtools mpileup with iVar.
+	
+		minimap2 -a -x map-ont -t 64 consensus_cleaned${id}.fasta ${output_dir}/tmp/barcode${id}_filt.fastq | samtools view -bS -F 4 - | samtools sort -o ${output_dir}/tmp/finalbarcode${id}_sorted.bam
+		align_trim --normalise 1000 ~/artic-ncov2019/primer_schemes/batcov/V5e//batcov.primer.bed > ${output_dir}/tmp/finalbarcode${id}_trim.bam < ${output_dir}/tmp/finalbarcode${id}_sorted.bam
+		samtools sort ${output_dir}/tmp/finalbarcode${id}_trim.bam -o ${output_dir}/tmp/finalbarcode${id}.trim_sorted.bam
+		samtools index ${output_dir}/tmp/finalbarcode${id}.trim_sorted.bam
+		samtools depth -a ${output_dir}/tmp/finalbarcode${id}.trim_sorted.bam > ${output_dir}/tmp/finalbarcode${id}.trim_coverage.txt
+		samtools coverage -m ${output_dir}/tmp/finalbarcode${id}.trim_sorted.bam -o ${output_dir}/tmp/finalbarcode${id}.primertrim_samtools_coverage
+		samtools mpileup -aa -A -d 600000 -Q 0 ${output_dir}/tmp/finalbarcode${id}.trim_sorted.bam | ivar consensus -p ${output_dir}/tmp/finalbarcode${id}.primertrim -q 1 -m 20 -n N
+		cp ${output_dir}/tmp/finalbarcode${id}.primertrim.fa ${output_dir}
+	
+		##Note: generating a final consensus sequence.
+	
+	## Intra-host single-nucleotide variant (iSNV) analysis of a putative co-infection was conducted using iVar
+	    samtools mpileup -aa -A -d 600000 -B -Q 0 ${output_dir}/tmp/finalbarcode${id}.trim_sorted.bam | ivar variants -p batcov_variant -q 1 -t 0.03 -m 20 -r consensus_cleaned${id}.fasta -g sarslikenew_batcov.gff
+	
+	fi
+done
+
+# #append sample name to fasta headers
+# if [ ! -z "$(ls -A ${read_dir}/translate.xlsx)"  ]; then
+	# conda deactivate
+	# conda activate csvtk_env
+	# csvtk xlsx2csv --out-delimiter $'\t' ${read_dir}/translate.xlsx | csvtk del-header > ${output_dir}/tmp/translate.txt
+
+	# for id in `echo 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 | cat`; do 
+		# if [ ! -z "$(ls -A ${output_dir}/barcode${id}.consensus.fasta)"  ]; then
+			# sed -i "s/ARTIC/ARTIC_${PrimerSet}/g" ${output_dir}/barcode${id}.consensus.fasta
+			# while read a b; do sed -i "s/$a/$b\_$a/g" ${output_dir}/barcode${id}.consensus.fasta ; done < ${output_dir}/tmp/translate.txt
+		# fi
+	# done
+
+	# #rename consensus files
+	# while read a b ; do mv ${output_dir}/${a}.consensus.fasta ${output_dir}/${a}_${b}.consensus.fasta; done < ${output_dir}/tmp/translate.txt
+# fi
